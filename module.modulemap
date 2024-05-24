@@ -1,0 +1,4 @@
+module CarbonBridge {
+    header "carbon-bridge.h"
+    export *
+}
