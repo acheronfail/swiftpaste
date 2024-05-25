@@ -2,15 +2,7 @@ import CarbonBridge
 import Cocoa
 import Foundation
 
-let DOUBLE_CLICK_INTERVAL: Double = 0.5
-let DRAG_THRESHOLD: CGFloat = 4
-
-var clip: String = ""
-
-/// State that's passed into the event callback.
-struct State {
-  var pasteEnabled: Bool
-
+struct Clicks {
   var leftClick1: Date?
   var leftClick2: Date?
 
@@ -31,6 +23,14 @@ struct State {
   }
 }
 
+let CLIP_CHECK_INTERVAL: Double = 0.2
+let CLIP_CHECK_TIMEOUT: Double = 2.0
+let DOUBLE_CLICK_INTERVAL: Double = 0.5
+let DRAG_THRESHOLD_PX: CGFloat = 4
+
+var clip: String = ""
+var clicks = Clicks(wasDragging: false)
+
 func sendKey(_ key: CGKeyCode, _ flags: CGEventFlags?) {
   if let source = CGEventSource(stateID: .combinedSessionState) {
     // Disable local keyboard events while sending key events
@@ -47,95 +47,110 @@ func sendKey(_ key: CGKeyCode, _ flags: CGEventFlags?) {
     kbdEventDown?.post(tap: .cgSessionEventTap)
     kbdEventUp?.post(tap: .cgSessionEventTap)
   }
-
 }
 
+func setPasteboard(_ savedItems: [NSPasteboardItem]?) {
+  // clear
+  NSPasteboard.general.clearContents()
+
+  // restore
+  if let items = savedItems {
+    //   NSPasteboard.general.writeObjects(items)
+    for item in items {
+      for type in item.types {
+        if let data = item.data(forType: type) {
+          NSPasteboard.general.setData(data, forType: type)
+        }
+      }
+    }
+  }
+}
+
+// https://github.com/p0deje/Maccy/blob/cc2435598c937cbfe6b58ca42f173954827501bc/Maccy/Clipboard.swift#L135
 func doPaste() {
-  // TODO: put clip back into pasteboard, paste, then restore pasteboard again
-  // https://github.com/p0deje/Maccy/blob/cc2435598c937cbfe6b58ca42f173954827501bc/Maccy/Clipboard.swift#L135
-  // sendKey(CGKeyCode(CarbonBridge.kVK_ANSI_C), CGEventFlags.maskCommand)
+  // save
+  let savedItems = NSPasteboard.general.pasteboardItems
+
+  // set saved text into clipboard
+  NSPasteboard.general.setString(clip, forType: .string)
+
+  // paste
+  sendKey(CGKeyCode(CarbonBridge.kVK_ANSI_V), CGEventFlags.maskCommand)
+
+  // FIXME: need to wait until paste has fired before we can clear it
+  sleep(1)
+  setPasteboard(savedItems)
 }
 
-func copyText() {
+/// Not sure if there's a better way to know if we've selected text or not across
+/// all applications (what if applications have their own custom text rendering?)
+/// So for now, we just fire the 'copy' event, read the clipboard, and then extract
+/// the text from that.
+func saveSelectedText(_ savedItems: [NSPasteboardItem]?) {
+  // extract
+  if let text = NSPasteboard.general.string(forType: .string) {
+    clip = text
+  }
+
+  // FIXME: don't conflict with maccy? (it has a 0.5s timer to check `changeCount`...)
+  // investigate other ways of detecting clipboard changes...
+
+  setPasteboard(savedItems)
+}
+
+func tryCopyText() {
   // first, save the contents of the clipboard
-  let pasteboard = NSPasteboard.general
-  let savedItems = pasteboard.pasteboardItems
-  let changeCount = pasteboard.changeCount
+  let savedItems = NSPasteboard.general.pasteboardItems
+  let changeCount = NSPasteboard.general.changeCount
 
   // then, trigger a copy
   sendKey(CGKeyCode(CarbonBridge.kVK_ANSI_C), CGEventFlags.maskCommand)
 
+  // finally, periodically check the clipboard to see if something was added to it
   let start = Date()
-  Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { timer in
-    if pasteboard.changeCount != changeCount {
+  Timer.scheduledTimer(withTimeInterval: CLIP_CHECK_INTERVAL, repeats: true) { timer in
+    if NSPasteboard.general.changeCount != changeCount {
       timer.invalidate()
-
-      // extract
-      if let text = pasteboard.string(forType: .string) {
-        clip = text
-      }
-
-      // FIXME: don't conflict with maccy? (it has a 0.5s timer to check `changeCount`)
-
-      // restore
-      pasteboard.clearContents()
-      if let items = savedItems {
-        //   pasteboard.writeObjects(items)
-        for item in items {
-          for type in item.types {
-            if let data = item.data(forType: type) {
-              pasteboard.setData(data, forType: type)
-            }
-          }
-        }
-      }
+      saveSelectedText(savedItems)
     }
 
     // expire after timeout
-    if Date().timeIntervalSince(start) > 2.0 {
+    if Date().timeIntervalSince(start) > CLIP_CHECK_TIMEOUT {
       timer.invalidate()
     }
   }
 }
 
 /// This function is called each time a keyboard or mouse event is received.
-let eventCallback: CGEventTapCallBack = { (proxy, type, event, userInfo) in
-  guard let userInfo = userInfo else { return nil }
-
-  let state = userInfo.assumingMemoryBound(to: State.self)
-  if !state.pointee.pasteEnabled {
-    print("paste disabled")
-    return Unmanaged.passRetained(event)
-  }
-
+let eventCallback: CGEventTapCallBack = { (proxy, type, event, _) in
   switch type {
   case .leftMouseDown:
-    state.pointee.recordClick()
+    clicks.recordClick()
   case .leftMouseUp:
-    if state.pointee.wasDoubleClick() {
+    if clicks.wasDoubleClick() {
       print("copy (multi-click)")
-      copyText()
-    } else if state.pointee.wasDragging {
+      tryCopyText()
+    } else if clicks.wasDragging {
       // ignore events which only dragged a few pixels, since even if it moves
       // a single pixel, then we get drag events
-      if let start = state.pointee.dragStart {
+      if let start = clicks.dragStart {
         let dx = (start.x - event.location.x).magnitude
         let dy = (start.y - event.location.y).magnitude
-        if dx > DRAG_THRESHOLD || dy > DRAG_THRESHOLD {
+        if dx > DRAG_THRESHOLD_PX || dy > DRAG_THRESHOLD_PX {
           print("copy (drag)")
-          copyText()
+          tryCopyText()
         }
       }
     }
-    state.pointee.wasDragging = false
+    clicks.wasDragging = false
   case .leftMouseDragged:
-    if !state.pointee.wasDragging {
-      state.pointee.dragStart = event.location
+    if !clicks.wasDragging {
+      clicks.dragStart = event.location
     }
 
-    state.pointee.wasDragging = true
+    clicks.wasDragging = true
   case .otherMouseDown:
-    print("clip: \(clip)")
+    // FIXME: some apps (like kitty) automatically map middle-click to paste
     doPaste()
   default:
     break
@@ -146,12 +161,6 @@ let eventCallback: CGEventTapCallBack = { (proxy, type, event, userInfo) in
 
 /// Main application function.
 func main() {
-  var userInfo = State(pasteEnabled: true, wasDragging: false)
-
-  if CommandLine.arguments.contains("-n") {
-    userInfo.pasteEnabled = false
-  }
-
   // have to declare it this way otherwise swift chucks a barney...
   let eventMaskParts: [CGEventMask] = [
     CGEventMask(1 << CGEventType.otherMouseDown.rawValue),
@@ -164,9 +173,6 @@ func main() {
     CGEventMask(1 << CGEventType.leftMouseDragged.rawValue),
   ]
   let eventMask = eventMaskParts.reduce(0, |)
-
-  let statePtr = UnsafeMutablePointer<State>.allocate(capacity: 1)
-  statePtr.initialize(to: userInfo)
   guard
     let eventTap = CGEvent.tapCreate(
       tap: .cgSessionEventTap,
@@ -174,7 +180,7 @@ func main() {
       options: .listenOnly,
       eventsOfInterest: eventMask,
       callback: eventCallback,
-      userInfo: statePtr)
+      userInfo: nil)
   else {
     print("Failed to create event tap")
     exit(1)
@@ -187,9 +193,6 @@ func main() {
   CFRunLoopRun()
 
   // NOTE: unreachable, since CFRunLoopRun doesn't return
-
-  statePtr.deinitialize(count: 1)
-  statePtr.deallocate()
 }
 
 main()
